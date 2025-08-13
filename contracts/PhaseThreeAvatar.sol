@@ -10,23 +10,10 @@ import "@openzeppelin/contracts/utils/Address.sol";
 import "@openzeppelin/contracts/utils/Strings.sol";
 import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import "@chainlink/contracts/src/v0.8/shared/access/ConfirmedOwner.sol";
-import "@chainlink/contracts/src/v0.8/vrf/VRFV2WrapperConsumerBase.sol";
 
-contract PhaseThreeAvatar is ERC721AQueryable, ERC2981, VRFV2WrapperConsumerBase, ConfirmedOwner, Pausable {
+contract PhaseThreeAvatar is ERC721AQueryable, ERC2981, ConfirmedOwner, Pausable {
     using Address for address payable;
     using Strings for uint256;
-
-    struct RequestStatus {
-        uint256 paid;
-        bool fulfilled;
-        uint256[] randomWords;
-    }
-
-    struct RequestConfig {
-        uint32 callbackGasLimit;
-        uint16 requestConfirmations;
-        uint32 numWords;
-    }
 
     /*///////////////////////////////////////////////////////////////
                          State Variables
@@ -53,14 +40,9 @@ contract PhaseThreeAvatar is ERC721AQueryable, ERC2981, VRFV2WrapperConsumerBase
     /// @dev avatar token id => soulbound token id
     mapping(uint256 => uint256) public avatarToSoulbound;
 
-    /// @dev Chainlink VRF related settings
+    /// @dev Backend random number related settings
     bool public revealed;
-    uint256 public requestId;
-    RequestStatus public requestStatus;
     uint256 public randomSeedMetadata;
-    IERC20 public linkTokenContract;
-    VRFV2WrapperInterface public vrfWrapper;
-    RequestConfig public requestConfig;
 
     /*///////////////////////////////////////////////////////////////
                             Events or Errors
@@ -70,6 +52,7 @@ contract PhaseThreeAvatar is ERC721AQueryable, ERC2981, VRFV2WrapperConsumerBase
     error ExceedMaxTokens();
     error TokenNotExist();
     error Revealed();
+    error NotRevealed();
     error InvalidInput();
     error InvalidTimestamp();
     error InvalidSignature();
@@ -79,8 +62,7 @@ contract PhaseThreeAvatar is ERC721AQueryable, ERC2981, VRFV2WrapperConsumerBase
     event ParametersSet(string parameter, uint256 value);
     event AddressSet(string parameter, address value);
 
-    event RequestSent(uint256 requestId, uint32 numWords);
-    event RequestFulfilled(uint256 requestId, uint256[] randomWords, uint256 payment);
+    event RandomSeedSet(uint256 randomSeed);
 
     /*///////////////////////////////////////////////////////////////
                             Constructor
@@ -92,31 +74,15 @@ contract PhaseThreeAvatar is ERC721AQueryable, ERC2981, VRFV2WrapperConsumerBase
         address _signer,
         uint64 _maxSupply,
         uint96 _royaltyFee,
-        address _linkAddress,
-        address _wrapperAddress,
-        uint32 _callbackGasLimit,
-        uint16 _requestConfirmations,
         string memory _randomSeedHash,
         string memory _randomAlgoHash
     )
         ERC721A("PhaseThreeAvatar", "PTA")
         ConfirmedOwner(msg.sender)
-        VRFV2WrapperConsumerBase(_linkAddress, _wrapperAddress)
     {
-        require(_linkAddress != address(0), "Link Token address cannot be 0x0");
-        require(_wrapperAddress != address(0), "Wrapper address cannot be 0x0");
-
-        maxSupply = _maxSupply;
-        vrfWrapper = VRFV2WrapperInterface(_wrapperAddress);
-        linkTokenContract = IERC20(_linkAddress);
-        requestConfig = RequestConfig({
-            callbackGasLimit: _callbackGasLimit,
-            requestConfirmations: _requestConfirmations,
-            numWords: 1
-        });
-
         if (_treasury == address(0) || _mintRole == address(0) || _signer == address(0)) revert InvalidAddressZero();
 
+        maxSupply = _maxSupply;
         treasury = _treasury;
         mintRole = _mintRole;
         signer = _signer;
@@ -164,8 +130,42 @@ contract PhaseThreeAvatar is ERC721AQueryable, ERC2981, VRFV2WrapperConsumerBase
      */
     function tokenURI(uint256 _tokenId) public view override(IERC721A, ERC721A) returns (string memory _tokenURI) {
         if (!_exists(_tokenId)) revert TokenNotExist();
+        if (!revealed) revert NotRevealed();
 
-        return string(abi.encodePacked(uriPrefix, _tokenId.toString(), uriSuffix));
+        // Derive a seed-based affine permutation over [0, maxSupply-1]
+        // meta = (a * tokenIndex + b) mod N, where gcd(a, N) == 1 to ensure bijection
+        uint256 N = uint256(maxSupply);
+        (uint256 a, uint256 b) = _derivePermutationParams(N);
+
+        uint256 zeroIndexedToken = _tokenId - 1;
+        uint256 zeroIndexedMeta = addmod(mulmod(a, zeroIndexedToken, N), b, N);
+        uint256 metadataId = zeroIndexedMeta + 1; // 1..maxSupply
+
+        return string(abi.encodePacked(uriPrefix, metadataId.toString(), uriSuffix));
+    }
+
+    function _gcd(uint256 _x, uint256 _y) internal pure returns (uint256) {
+        while (_y != 0) {
+            uint256 temp = _y;
+            _y = _x % _y;
+            _x = temp;
+        }
+        return _x;
+    }
+
+    function _derivePermutationParams(uint256 _modulus) internal view returns (uint256 a, uint256 b) {
+        require(_modulus > 1, "Invalid modulus");
+        // Derive candidates from the seed
+        bytes32 ha = keccak256(abi.encodePacked(randomSeedMetadata, "a"));
+        bytes32 hb = keccak256(abi.encodePacked(randomSeedMetadata, "b"));
+        a = uint256(ha) % _modulus;
+        if (a == 0) a = 1;
+        // Ensure a is coprime to modulus
+        while (_gcd(a, _modulus) != 1) {
+            a = (a + 1) % _modulus;
+            if (a == 0) a = 1;
+        }
+        b = uint256(hb) % _modulus;
     }
 
     function _startTokenId() internal pure override returns (uint256) {
@@ -387,55 +387,29 @@ contract PhaseThreeAvatar is ERC721AQueryable, ERC2981, VRFV2WrapperConsumerBase
     }
 
     /*///////////////////////////////////////////////////////////////
-                        Chainlink VRF Functions
+                        Backend Random Seed Functions
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @dev Sends a VRF request and transfers the cost of the request to the contract
-     * @return requestId The ID of the VRF request
+     * @dev Set random seed from backend and reveal the metadata
+     * @param _randomSeed The random seed generated by backend
+     * @notice This function can only be called by the owner once
      */
-    function requestRandomWords() external onlyOwner returns (uint256 /*requestId*/ ) {
+    function setRandomSeed(uint256 _randomSeed) external onlyOwner {
         if (revealed) revert Revealed();
-        // Calculate the amount of LINK to send with the request
-        uint256 requestPrice = vrfWrapper.calculateRequestPrice(requestConfig.callbackGasLimit);
-        // Transfer the LINK to the VRF Wrapper contract
-        // The VRF Wrapper contract will transfer the LINK to the VRF Coordinator
-        require(linkTokenContract.transferFrom(msg.sender, address(this), requestPrice), "Not enough LINK");
-        // Send the request to the VRF Wrapper contract
-        requestId = requestRandomness(
-            requestConfig.callbackGasLimit, requestConfig.requestConfirmations, requestConfig.numWords
-        );
-        // Update the request status in the mapping
-        requestStatus = RequestStatus({paid: requestPrice, randomWords: new uint256[](0), fulfilled: false});
-        emit RequestSent(requestId, requestConfig.numWords);
-        return requestId;
-    }
-
-    /**
-     * @dev Fulfills a VRF request by updating the request status in the mapping
-     * @param _requestId The ID of the VRF request to fulfill
-     * @param _randomWords The array of random words generated by the VRF request
-     */
-    function fulfillRandomWords(uint256 _requestId, uint256[] memory _randomWords) internal override {
-        require(requestStatus.paid > 0, "request not found");
-        requestStatus.fulfilled = true;
-        requestStatus.randomWords = _randomWords;
-
-        randomSeedMetadata = _randomWords[0];
+        
+        randomSeedMetadata = _randomSeed;
         revealed = true;
-
-        emit RequestFulfilled(_requestId, _randomWords, requestStatus.paid);
+        
+        emit RandomSeedSet(_randomSeed);
     }
 
     /**
-     * @dev Retrieves the status of a VRF request
-     * @return paid The cost of the VRF request
-     * @return fulfilled Whether or not the VRF request has been fulfilled
-     * @return randomWords The array of random words generated by the VRF request
+     * @dev Get the current random seed and reveal status
+     * @return randomSeed The current random seed
+     * @return isRevealed Whether the random seed has been revealed
      */
-    function getRequestStatus() external view returns (uint256 paid, bool fulfilled, uint256[] memory randomWords) {
-        require(requestStatus.paid > 0, "request not found");
-        RequestStatus memory request = requestStatus;
-        return (request.paid, request.fulfilled, request.randomWords);
+    function getRandomSeedStatus() external view returns (uint256 randomSeed, bool isRevealed) {
+        return (randomSeedMetadata, revealed);
     }
 }
